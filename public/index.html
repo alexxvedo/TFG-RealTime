@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Demo de Actividad en Tiempo Real</title>
+    <script src="/socket.io/socket.io.js"></script>
+  </head>
+  <body>
+    <h1>Demo de Actividad en Tiempo Real</h1>
+    <button id="sendActivity">Enviar Actividad</button>
+    <div id="updates"></div>
+
+    <script>
+      // Conectar al servidor de Socket.IO
+      const socket = io();
+
+      // Al hacer clic en el botón, se envía un evento de actividad
+      document.getElementById("sendActivity").addEventListener("click", () => {
+        // Simulamos que el usuario 1 realiza una acción (por ejemplo, entrar a una colección)
+        const activityData = {
+          userId: 1,
+          activity: "Entró a la colección de flashcards",
+        };
+        socket.emit("activity", activityData);
+      });
+
+      // Mostrar en pantalla las actividades que se reciben de otros clientes
+      socket.on("activity_update", (data) => {
+        const div = document.getElementById("updates");
+        const p = document.createElement("p");
+        p.textContent = "Actividad recibida: " + JSON.stringify(data);
+        div.appendChild(p);
+      });
+    </script>
+  </body>
+</html>
