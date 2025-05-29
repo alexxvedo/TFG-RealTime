@@ -1,18 +1,31 @@
 {
   "name": "real-time-example",
   "version": "1.0.0",
-  "description": "",
-  "main": "server.js",
+  "description": "Servidor WebSocket robusto con arquitectura modular",
+  "main": "src/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "test": "jest",
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "compression": "^1.7.4",
+    "dotenv": "^16.3.1",
     "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.3",
+    "pino": "^8.16.2",
+    "pino-pretty": "^10.2.3",
+    "redis": "^4.6.10",
     "socket.io": "^4.8.1",
-    "socketio": "^1.0.0"
+    "socket.io-redis": "^6.1.1",
+    "socketio": "^1.0.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.1"
   }
 }

@@ -3,6 +3,8 @@
 const express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
+const { notifyWorkspaceDeleted } = require('./workspace-events');
+const { notifyCollectionDeleted } = require('./collection-events');
 
 const app = express();
 const server = http.createServer(app);
@@ -24,6 +26,50 @@ let typingUsers = new Map(); // workspaceId -> Map(userId -> {name, timestamp})
 
 io.on("connection", (socket) => {
   console.log(`Usuario conectado: ${socket.id}`);
+  
+  // Manejar evento de eliminación de workspace
+  socket.on("workspace_deleted", (data) => {
+    const { workspaceId, deletedBy } = data;
+    console.log(`Workspace ${workspaceId} eliminado por ${deletedBy?.email || 'desconocido'}`);
+    
+    // Notificar a todos los usuarios conectados al workspace
+    notifyWorkspaceDeleted(io, workspaceId, deletedBy);
+    
+    // Limpiar datos del workspace eliminado
+    if (workspaceSockets[workspaceId]) {
+      delete workspaceSockets[workspaceId];
+    }
+    
+    if (collectionUsers.has(workspaceId)) {
+      collectionUsers.delete(workspaceId);
+    }
+    
+    if (workspaceMessages.has(workspaceId)) {
+      workspaceMessages.delete(workspaceId);
+    }
+    
+    if (userLastSeen.has(workspaceId)) {
+      userLastSeen.delete(workspaceId);
+    }
+    
+    if (typingUsers.has(workspaceId)) {
+      typingUsers.delete(workspaceId);
+    }
+  });
+  
+  // Manejar evento de eliminación de colección
+  socket.on("collection_deleted", (data) => {
+    const { workspaceId, collectionId, deletedBy } = data;
+    console.log(`Colección ${collectionId} en workspace ${workspaceId} eliminada por ${deletedBy?.email || 'desconocido'}`);
+    
+    // Notificar a todos los usuarios conectados al workspace
+    notifyCollectionDeleted(io, workspaceId, collectionId, deletedBy);
+    
+    // Limpiar datos de la colección eliminada
+    if (collectionUsers.has(workspaceId) && collectionUsers.get(workspaceId).has(collectionId)) {
+      collectionUsers.get(workspaceId).delete(collectionId);
+    }
+  });
 
   socket.on("join_workspace", (workspaceId, userData) => {
     console.log(
