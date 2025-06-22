@@ -45,28 +45,74 @@ const io = socketIo(server, {
   }
 });
 
-// Ruta para monitoreo de estado
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
-});
-
-// Ruta para métricas (protegida en producción)
-app.get('/metrics', (req, res) => {
+// Middleware para autenticación de endpoints de monitoreo en producción
+const authenticateMetricsEndpoint = (req, res, next) => {
   if (config.environment === 'production') {
-    // En producción, esta ruta debería estar protegida
-    // Aquí se podría implementar autenticación
     const authHeader = req.headers.authorization;
     if (!authHeader || authHeader !== `Bearer ${process.env.METRICS_API_KEY}`) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
   }
-  
-  const metrics = metricsService.getMetricsSummary();
+  next();
+};
+
+// Ruta para monitoreo de estado básico (sin autenticación)
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: config.environment
+  });
+});
+
+// Ruta para métricas básicas (protegida en producción)
+app.get('/metrics', authenticateMetricsEndpoint, (req, res) => {
+  const metrics = metricsService.getMetricsSummary(false);
   res.status(200).json(metrics);
+});
+
+// Ruta para métricas detalladas (protegida en producción)
+app.get('/metrics/detailed', authenticateMetricsEndpoint, (req, res) => {
+  const metrics = metricsService.getMetricsSummary(true);
+  res.status(200).json(metrics);
+});
+
+// Ruta para estado de Redis (protegida en producción)
+app.get('/health/redis', authenticateMetricsEndpoint, async (req, res) => {
+  try {
+    const healthResult = await redisService.healthCheck();
+    const status = healthResult.status === 'healthy' ? 200 : 
+                  healthResult.status === 'degraded' ? 429 : 503;
+    
+    res.status(status).json(healthResult);
+  } catch (error) {
+    logger.error({ error: error.message }, 'Error al obtener estado de Redis');
+    res.status(500).json({
+      status: 'error',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Ruta para configurar la caché de Redis (protegida en producción)
+app.post('/admin/redis/cache', authenticateMetricsEndpoint, express.json(), (req, res) => {
+  try {
+    const { enabled, ttl } = req.body;
+    const result = redisService.configureCaching({ enabled, ttl });
+    res.status(200).json({
+      success: true,
+      message: 'Configuración de caché actualizada',
+      config: result
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, 'Error al configurar caché de Redis');
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 // Inicializar el servicio Redis
@@ -194,5 +240,9 @@ server.listen(PORT, () => {
   }, 'Servidor WebSocket iniciado');
   
   console.log(`Servidor WebSocket escuchando en el puerto ${PORT}`);
-  console.log(`Métricas disponibles en http://localhost:${PORT}/metrics`);
+  console.log('Endpoints de monitoreo disponibles:');
+  console.log(`- Estado básico: http://localhost:${PORT}/health`);
+  console.log(`- Métricas básicas: http://localhost:${PORT}/metrics`);
+  console.log(`- Métricas detalladas: http://localhost:${PORT}/metrics/detailed`);
+  console.log(`- Estado de Redis: http://localhost:${PORT}/health/redis`);
 });
