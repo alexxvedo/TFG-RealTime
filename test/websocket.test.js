@@ -1,391 +1,920 @@
 /**
- * Tests unitarios para el servidor WebSocket
- * Valida las funcionalidades de tiempo real para chat, notas colaborativas y notificaciones
+ * Tests unitarios para handlers WebSocket
+ * Valida la lógica de negocio de los handlers sin depender de conexiones reales
  */
 
-const { createServer } = require("http");
-const { Server } = require("socket.io");
-const Client = require("socket.io-client");
-const jwt = require("jsonwebtoken");
+// Importar handlers reales
+const ChatHandler = require("../src/modules/chat/chat.handler");
+const WorkspaceHandler = require("../src/modules/workspace/workspace.handler");
+const NoteHandler = require("../src/modules/note/note.handler");
+const CollectionHandler = require("../src/modules/collection/collection.handler");
 
-describe("WebSocket Server Tests", () => {
-  let io, serverSocket, clientSocket, httpServer;
-  const JWT_SECRET = "test-secret";
+// Mock de servicios para evitar dependencias externas
+jest.mock("../src/services/redis", () => ({
+  get: jest.fn().mockResolvedValue(null),
+  set: jest.fn().mockResolvedValue(true),
+  del: jest.fn().mockResolvedValue(true),
+  exists: jest.fn().mockResolvedValue(false),
+  initialize: jest.fn().mockResolvedValue(true),
+  healthCheck: jest.fn().mockResolvedValue({ status: "healthy" }),
+}));
 
-  beforeAll((done) => {
-    httpServer = createServer();
-    io = new Server(httpServer);
+jest.mock("../src/services/metrics", () => ({
+  connectionCreated: jest.fn(),
+  connectionClosed: jest.fn(),
+  messageProcessed: jest.fn(),
+  errorOccurred: jest.fn(),
+  getMetricsSummary: jest.fn().mockReturnValue({}),
+  userJoinedWorkspace: jest.fn(),
+  userLeftWorkspace: jest.fn(),
+}));
 
-    httpServer.listen(() => {
-      const port = httpServer.address().port;
+jest.mock("../src/utils/logger", () => ({
+  info: jest.fn(),
+  error: jest.fn(),
+  warn: jest.fn(),
+  debug: jest.fn(),
+}));
 
-      // Configurar autenticación mock
-      io.use((socket, next) => {
-        const token = socket.handshake.auth.token;
-        if (token) {
-          try {
-            const decoded = jwt.verify(token, JWT_SECRET);
-            socket.userId = decoded.userId;
-            socket.userEmail = decoded.email;
-            next();
-          } catch (err) {
-            next(new Error("Authentication error"));
-          }
-        } else {
-          next(new Error("No token provided"));
-        }
+const redisService = require("../src/services/redis");
+const metricsService = require("../src/services/metrics");
+
+describe("WebSocket Handlers Unit Tests", () => {
+  let mockIo, mockSocket;
+
+  beforeEach(() => {
+    // Reset all mocks
+    jest.clearAllMocks();
+
+    // Mock del servidor Socket.IO
+    mockIo = {
+      to: jest.fn().mockReturnValue({
+        emit: jest.fn(),
+      }),
+      emit: jest.fn(),
+    };
+
+    // Mock del socket individual
+    mockSocket = {
+      id: "test-socket-id",
+      user: {
+        id: "test-user-1",
+        email: "test@example.com",
+        name: "Test User",
+      },
+      join: jest.fn(),
+      leave: jest.fn(),
+      emit: jest.fn(),
+      to: jest.fn().mockReturnValue({
+        emit: jest.fn(),
+      }),
+      on: jest.fn(),
+    };
+  });
+
+  describe("ChatHandler", () => {
+    let chatHandler;
+
+    beforeEach(() => {
+      chatHandler = new ChatHandler(mockIo);
+    });
+
+    describe("registerHandlers", () => {
+      test("debe registrar todos los handlers de eventos", () => {
+        chatHandler.registerHandlers(mockSocket);
+
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "new_message",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "user_typing",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "user_stop_typing",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledTimes(3);
+      });
+    });
+
+    describe("handleNewMessage", () => {
+      test("debe procesar un mensaje válido correctamente", async () => {
+        const messageData = {
+          workspaceId: "workspace-123",
+          senderEmail: "test@example.com",
+          senderName: "Test User",
+          content: "Hello world",
+        };
+
+        await chatHandler.handleNewMessage(mockSocket, messageData);
+
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockIo.to).toHaveBeenCalledWith("workspace-123");
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "new_message",
+          expect.any(Object)
+        );
+        expect(metricsService.messageProcessed).toHaveBeenCalledWith(
+          "new_message",
+          expect.any(Number)
+        );
       });
 
-      // Configurar handlers básicos
-      io.on("connection", (socket) => {
-        serverSocket = socket;
+      test("debe rechazar mensajes con datos incompletos", async () => {
+        const invalidMessageData = {
+          workspaceId: "workspace-123",
+          senderEmail: "test@example.com",
+          // Falta content
+        };
 
-        // Handler para unirse a workspace
-        socket.on("join-workspace", (workspaceId) => {
-          socket.join(`workspace-${workspaceId}`);
-          socket.emit("workspace-joined", { workspaceId });
+        await chatHandler.handleNewMessage(mockSocket, invalidMessageData);
+
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "error",
+          expect.objectContaining({ message: "Datos de mensaje incompletos" })
+        );
+        expect(redisService.set).not.toHaveBeenCalled();
+      });
+
+      test("debe manejar errores de Redis gracefully", async () => {
+        redisService.set.mockRejectedValueOnce(new Error("Redis error"));
+
+        const messageData = {
+          workspaceId: "workspace-123",
+          senderEmail: "test@example.com",
+          senderName: "Test User",
+          content: "Hello world",
+        };
+
+        await chatHandler.handleNewMessage(mockSocket, messageData);
+
+        expect(metricsService.errorOccurred).toHaveBeenCalledWith(
+          "new_message",
+          expect.objectContaining({ error: "Redis error" })
+        );
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "error",
+          expect.any(Object)
+        );
+      });
+    });
+
+    describe("handleUserTyping", () => {
+      test("debe manejar evento de usuario escribiendo", async () => {
+        const typingData = {
+          workspaceId: "workspace-123",
+          email: "test@example.com",
+          name: "Test User",
+        };
+
+        await chatHandler.handleUserTyping(mockSocket, typingData);
+
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockIo.to).toHaveBeenCalledWith("workspace-123");
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "user_typing",
+          expect.objectContaining({
+            email: "test@example.com",
+            name: "Test User",
+          })
+        );
+        expect(metricsService.messageProcessed).toHaveBeenCalledWith(
+          "user_typing"
+        );
+      });
+
+      test("debe ignorar datos incompletos sin fallar", async () => {
+        const invalidData = { workspaceId: "workspace-123" }; // Falta email
+
+        await chatHandler.handleUserTyping(mockSocket, invalidData);
+
+        expect(redisService.set).not.toHaveBeenCalled();
+        expect(mockIo.to).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("handleUserStopTyping", () => {
+      test("debe manejar evento de usuario que deja de escribir", async () => {
+        const typingData = {
+          workspaceId: "workspace-123",
+          email: "test@example.com",
+          name: "Test User",
+        };
+
+        await chatHandler.handleUserStopTyping(mockSocket, typingData);
+
+        expect(redisService.get).toHaveBeenCalled();
+        expect(mockIo.to).toHaveBeenCalledWith("workspace-123");
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "user_stop_typing",
+          expect.objectContaining({ email: "test@example.com" })
+        );
+      });
+    });
+  });
+
+  describe("WorkspaceHandler", () => {
+    let workspaceHandler;
+
+    beforeEach(() => {
+      workspaceHandler = new WorkspaceHandler(mockIo);
+    });
+
+    describe("registerHandlers", () => {
+      test("debe registrar todos los handlers de eventos", () => {
+        workspaceHandler.registerHandlers(mockSocket);
+
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "join_workspace",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "leave_workspace",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "get_workspace_users",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledTimes(3);
+      });
+    });
+
+    describe("handleJoinWorkspace", () => {
+      test("debe permitir unirse a un workspace", async () => {
+        const workspaceId = "workspace-123";
+        const userData = {
+          id: "user-1",
+          email: "test@example.com",
+          name: "Test User",
+        };
+
+        redisService.get.mockResolvedValueOnce({});
+
+        await workspaceHandler.handleJoinWorkspace(
+          mockSocket,
+          workspaceId,
+          userData
+        );
+
+        expect(mockSocket.join).toHaveBeenCalledWith(workspaceId);
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockIo.to).toHaveBeenCalledWith(workspaceId);
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "users_connected",
+          expect.any(Array)
+        );
+        expect(mockIo.to().emit).toHaveBeenCalledWith("user_joined", userData);
+        expect(metricsService.userJoinedWorkspace).toHaveBeenCalledWith(
+          workspaceId,
+          userData.id
+        );
+      });
+
+      test("debe manejar errores al unirse al workspace", async () => {
+        redisService.set.mockRejectedValueOnce(new Error("Redis error"));
+
+        const workspaceId = "workspace-123";
+        const userData = {
+          id: "user-1",
+          email: "test@example.com",
+          name: "Test User",
+        };
+
+        await workspaceHandler.handleJoinWorkspace(
+          mockSocket,
+          workspaceId,
+          userData
+        );
+
+        expect(metricsService.errorOccurred).toHaveBeenCalledWith(
+          "join_workspace",
+          expect.objectContaining({ error: "Redis error" })
+        );
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "error",
+          expect.any(Object)
+        );
+      });
+    });
+
+    describe("handleLeaveWorkspace", () => {
+      test("debe permitir salir de un workspace", async () => {
+        const workspaceId = "workspace-123";
+
+        redisService.get.mockResolvedValueOnce({
+          "test-socket-id": {
+            id: "user-1",
+            email: "test@example.com",
+            name: "Test User",
+          },
         });
 
-        // Handler para chat
-        socket.on("send-message", (data) => {
-          const message = {
-            id: Date.now(),
-            content: data.content,
-            userId: socket.userId,
-            userEmail: socket.userEmail,
-            timestamp: new Date().toISOString(),
-            workspaceId: data.workspaceId,
-          };
+        await workspaceHandler.handleLeaveWorkspace(mockSocket, workspaceId);
 
-          socket
-            .to(`workspace-${data.workspaceId}`)
-            .emit("new-message", message);
-          socket.emit("message-sent", message);
+        expect(mockSocket.leave).toHaveBeenCalledWith(workspaceId);
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockIo.to).toHaveBeenCalledWith(workspaceId);
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "user_left",
+          expect.any(Object)
+        );
+        expect(metricsService.userLeftWorkspace).toHaveBeenCalled();
+      });
+    });
+
+    describe("handleGetWorkspaceUsers", () => {
+      test("debe retornar usuarios conectados al workspace", async () => {
+        const workspaceId = "workspace-123";
+        const mockUsers = {
+          "socket-1": { id: "user-1", email: "user1@example.com" },
+          "socket-2": { id: "user-2", email: "user2@example.com" },
+        };
+
+        redisService.get.mockResolvedValueOnce(mockUsers);
+
+        await workspaceHandler.handleGetWorkspaceUsers(mockSocket, workspaceId);
+
+        expect(redisService.get).toHaveBeenCalledWith(
+          "workspace:workspace-123:users"
+        );
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "users_connected",
+          Object.values(mockUsers)
+        );
+        expect(metricsService.messageProcessed).toHaveBeenCalledWith(
+          "get_workspace_users",
+          expect.any(Number)
+        );
+      });
+    });
+  });
+
+  describe("NoteHandler", () => {
+    let noteHandler;
+
+    beforeEach(() => {
+      noteHandler = new NoteHandler(mockIo);
+    });
+
+    describe("registerHandlers", () => {
+      test("debe registrar todos los handlers de eventos", () => {
+        noteHandler.registerHandlers(mockSocket);
+
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "join_note",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "leave_note",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "cursor_update",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "note_content_update",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledTimes(4);
+      });
+    });
+
+    describe("handleJoinNote", () => {
+      test("debe permitir unirse a una nota", async () => {
+        const workspaceId = "workspace-123";
+        const noteId = "note-456";
+        const userData = {
+          id: "user-1",
+          email: "test@example.com",
+          name: "Test User",
+        };
+
+        redisService.get.mockResolvedValueOnce(null); // No content in Redis
+
+        await noteHandler.handleJoinNote(
+          mockSocket,
+          workspaceId,
+          noteId,
+          userData
+        );
+
+        expect(mockSocket.join).toHaveBeenCalledWith(
+          `note:${workspaceId}:${noteId}`
+        );
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "note_content_loaded",
+          expect.objectContaining({ noteId, content: "" })
+        );
+        expect(mockIo.to).toHaveBeenCalledWith(`note:${workspaceId}:${noteId}`);
+        expect(metricsService.messageProcessed).toHaveBeenCalledWith(
+          "join_note",
+          expect.any(Number)
+        );
+      });
+
+      test("debe cargar contenido existente de la nota", async () => {
+        const workspaceId = "workspace-123";
+        const noteId = "note-456";
+        const userData = {
+          id: "user-1",
+          email: "test@example.com",
+          name: "Test User",
+        };
+        const existingContent = "Contenido existente de la nota";
+
+        redisService.get.mockResolvedValueOnce(existingContent);
+
+        await noteHandler.handleJoinNote(
+          mockSocket,
+          workspaceId,
+          noteId,
+          userData
+        );
+
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "note_content_loaded",
+          expect.objectContaining({ noteId, content: existingContent })
+        );
+      });
+    });
+
+    describe("handleLeaveNote", () => {
+      test("debe permitir salir de una nota", async () => {
+        const workspaceId = "workspace-123";
+        const noteId = "note-456";
+
+        await noteHandler.handleLeaveNote(mockSocket, workspaceId, noteId);
+
+        expect(mockSocket.leave).toHaveBeenCalledWith(
+          `note:${workspaceId}:${noteId}`
+        );
+        expect(redisService.set).toHaveBeenCalled();
+      });
+    });
+
+    describe("handleContentUpdate", () => {
+      test("debe actualizar el contenido de una nota", async () => {
+        const workspaceId = "workspace-123";
+        const noteId = "note-456";
+        const content = "Nuevo contenido de la nota";
+
+        await noteHandler.handleContentUpdate(
+          mockSocket,
+          workspaceId,
+          noteId,
+          content
+        );
+
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockIo.to).toHaveBeenCalledWith(`note:${workspaceId}:${noteId}`);
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "note_content_updated",
+          expect.objectContaining({ noteId, content })
+        );
+      });
+
+      test("debe rechazar actualizaciones sin contenido", async () => {
+        const workspaceId = "workspace-123";
+        const noteId = "note-456";
+
+        await noteHandler.handleContentUpdate(
+          mockSocket,
+          workspaceId,
+          noteId,
+          null
+        );
+
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "error",
+          expect.objectContaining({ message: "Contenido de nota requerido" })
+        );
+        expect(redisService.set).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("handleCursorUpdate", () => {
+      test("debe actualizar la posición del cursor", async () => {
+        const workspaceId = "workspace-123";
+        const noteId = "note-456";
+        const cursorData = {
+          position: 42,
+          selection: { start: 42, end: 50 },
+        };
+
+        await noteHandler.handleCursorUpdate(
+          mockSocket,
+          workspaceId,
+          noteId,
+          cursorData
+        );
+
+        expect(mockIo.to).toHaveBeenCalledWith(`note:${workspaceId}:${noteId}`);
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "cursor_updated",
+          expect.objectContaining({
+            noteId,
+            userId: mockSocket.id,
+            cursor: cursorData,
+          })
+        );
+      });
+    });
+  });
+
+  describe("CollectionHandler", () => {
+    let collectionHandler;
+
+    beforeEach(() => {
+      collectionHandler = new CollectionHandler(mockIo);
+    });
+
+    describe("registerHandlers", () => {
+      test("debe registrar todos los handlers de eventos", () => {
+        collectionHandler.registerHandlers(mockSocket);
+
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "join_collection",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "leave_collection",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledWith(
+          "get_collections_users",
+          expect.any(Function)
+        );
+        expect(mockSocket.on).toHaveBeenCalledTimes(3);
+      });
+    });
+
+    describe("handleJoinCollection", () => {
+      test("debe permitir unirse a una colección", async () => {
+        const workspaceId = "workspace-123";
+        const collectionId = "collection-456";
+        const userData = {
+          id: "user-1",
+          email: "test@example.com",
+          name: "Test User",
+        };
+
+        redisService.get.mockResolvedValueOnce({});
+
+        await collectionHandler.handleJoinCollection(
+          mockSocket,
+          workspaceId,
+          collectionId,
+          userData
+        );
+
+        expect(mockSocket.join).toHaveBeenCalledWith(
+          `${workspaceId}:${collectionId}`
+        );
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockIo.to).toHaveBeenCalledWith(workspaceId);
+        expect(mockIo.to().emit).toHaveBeenCalledWith(
+          "collection_user_joined",
+          expect.objectContaining({ collectionId, userData })
+        );
+        expect(metricsService.messageProcessed).toHaveBeenCalledWith(
+          "join_collection",
+          expect.any(Number)
+        );
+      });
+
+      test("debe manejar errores al unirse a la colección", async () => {
+        redisService.set.mockRejectedValueOnce(new Error("Redis error"));
+
+        const workspaceId = "workspace-123";
+        const collectionId = "collection-456";
+        const userData = {
+          id: "user-1",
+          email: "test@example.com",
+          name: "Test User",
+        };
+
+        await collectionHandler.handleJoinCollection(
+          mockSocket,
+          workspaceId,
+          collectionId,
+          userData
+        );
+
+        expect(metricsService.errorOccurred).toHaveBeenCalledWith(
+          "join_collection",
+          expect.objectContaining({ error: "Redis error" })
+        );
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "error",
+          expect.any(Object)
+        );
+      });
+    });
+
+    describe("handleLeaveCollection", () => {
+      test("debe permitir salir de una colección", async () => {
+        const workspaceId = "workspace-123";
+        const collectionId = "collection-456";
+
+        redisService.get.mockResolvedValueOnce({
+          "test-socket-id": {
+            id: "user-1",
+            email: "test@example.com",
+            name: "Test User",
+          },
         });
 
-        // Handler para notas colaborativas
-        socket.on("note-update", (data) => {
-          socket.to(`note-${data.noteId}`).emit("note-changed", {
-            noteId: data.noteId,
-            content: data.content,
-            userId: socket.userId,
-            timestamp: new Date().toISOString(),
-          });
-        });
+        await collectionHandler.handleLeaveCollection(
+          mockSocket,
+          workspaceId,
+          collectionId
+        );
 
-        // Handler para cursor position
-        socket.on("cursor-position", (data) => {
-          socket.to(`note-${data.noteId}`).emit("cursor-update", {
-            userId: socket.userId,
-            userEmail: socket.userEmail,
-            position: data.position,
-            selection: data.selection,
-          });
-        });
-      });
-
-      done();
-    });
-  });
-
-  afterAll(() => {
-    io.close();
-    httpServer.close();
-  });
-
-  beforeEach((done) => {
-    // Crear token JWT válido para tests
-    const token = jwt.sign(
-      { userId: "test-user-1", email: "test@example.com" },
-      JWT_SECRET,
-      { expiresIn: "1h" }
-    );
-
-    clientSocket = new Client(`http://localhost:${httpServer.address().port}`, {
-      auth: { token },
-    });
-
-    clientSocket.on("connect", done);
-  });
-
-  afterEach(() => {
-    if (clientSocket.connected) {
-      clientSocket.disconnect();
-    }
-  });
-
-  describe("Autenticación", () => {
-    test("debe rechazar conexiones sin token", (done) => {
-      const unauthorizedClient = new Client(
-        `http://localhost:${httpServer.address().port}`
-      );
-
-      unauthorizedClient.on("connect_error", (error) => {
-        expect(error.message).toContain("Authentication error");
-        unauthorizedClient.close();
-        done();
+        expect(redisService.set).toHaveBeenCalled();
+        expect(mockSocket.leave).toHaveBeenCalledWith(
+          `${workspaceId}:${collectionId}`
+        );
+        expect(mockIo.to).toHaveBeenCalledWith(workspaceId);
       });
     });
 
-    test("debe rechazar tokens inválidos", (done) => {
-      const invalidClient = new Client(
-        `http://localhost:${httpServer.address().port}`,
-        {
-          auth: { token: "invalid-token" },
-        }
-      );
+    describe("handleGetCollectionsUsers", () => {
+      test("debe retornar usuarios en las colecciones", async () => {
+        const workspaceId = "workspace-123";
 
-      invalidClient.on("connect_error", (error) => {
-        expect(error.message).toContain("Authentication error");
-        invalidClient.close();
-        done();
-      });
-    });
+        await collectionHandler.handleGetCollectionsUsers(
+          mockSocket,
+          workspaceId
+        );
 
-    test("debe aceptar tokens válidos", () => {
-      expect(clientSocket.connected).toBe(true);
-    });
-  });
-
-  describe("Gestión de Workspaces", () => {
-    test("debe permitir unirse a un workspace", (done) => {
-      clientSocket.emit("join-workspace", "workspace-123");
-
-      clientSocket.on("workspace-joined", (data) => {
-        expect(data.workspaceId).toBe("workspace-123");
-        done();
-      });
-    });
-
-    test("debe manejar múltiples usuarios en el mismo workspace", (done) => {
-      const token2 = jwt.sign(
-        { userId: "test-user-2", email: "test2@example.com" },
-        JWT_SECRET,
-        { expiresIn: "1h" }
-      );
-
-      const client2 = new Client(
-        `http://localhost:${httpServer.address().port}`,
-        {
-          auth: { token: token2 },
-        }
-      );
-
-      client2.on("connect", () => {
-        clientSocket.emit("join-workspace", "workspace-123");
-        client2.emit("join-workspace", "workspace-123");
-
-        setTimeout(() => {
-          client2.close();
-          done();
-        }, 100);
+        expect(mockSocket.emit).toHaveBeenCalledWith(
+          "collections_users_updated",
+          expect.any(Object)
+        );
+        expect(metricsService.messageProcessed).toHaveBeenCalledWith(
+          "get_collections_users",
+          expect.any(Number)
+        );
       });
     });
   });
 
-  describe("Chat en Tiempo Real", () => {
-    beforeEach((done) => {
-      clientSocket.emit("join-workspace", "workspace-123");
-      clientSocket.on("workspace-joined", () => done());
-    });
-
-    test("debe enviar y recibir mensajes de chat", (done) => {
-      const token2 = jwt.sign(
-        { userId: "test-user-2", email: "test2@example.com" },
-        JWT_SECRET,
-        { expiresIn: "1h" }
+  describe("Error Handling", () => {
+    test("ChatHandler debe manejar errores de Redis", async () => {
+      const chatHandler = new ChatHandler(mockIo);
+      redisService.get.mockRejectedValueOnce(
+        new Error("Redis connection failed")
       );
 
-      const client2 = new Client(
-        `http://localhost:${httpServer.address().port}`,
-        {
-          auth: { token: token2 },
-        }
-      );
-
-      client2.on("connect", () => {
-        client2.emit("join-workspace", "workspace-123");
-
-        client2.on("new-message", (message) => {
-          expect(message.content).toBe("Hola desde el test");
-          expect(message.userEmail).toBe("test@example.com");
-          expect(message.workspaceId).toBe("workspace-123");
-          client2.close();
-          done();
-        });
-
-        // Enviar mensaje desde el primer cliente
-        setTimeout(() => {
-          clientSocket.emit("send-message", {
-            content: "Hola desde el test",
-            workspaceId: "workspace-123",
-          });
-        }, 100);
-      });
-    });
-
-    test("debe confirmar el envío de mensajes al remitente", (done) => {
-      clientSocket.on("message-sent", (message) => {
-        expect(message.content).toBe("Mensaje de confirmación");
-        expect(message.userId).toBe("test-user-1");
-        done();
-      });
-
-      clientSocket.emit("send-message", {
-        content: "Mensaje de confirmación",
+      const messageData = {
         workspaceId: "workspace-123",
-      });
-    });
-  });
-
-  describe("Notas Colaborativas", () => {
-    test("debe sincronizar cambios en notas", (done) => {
-      const token2 = jwt.sign(
-        { userId: "test-user-2", email: "test2@example.com" },
-        JWT_SECRET,
-        { expiresIn: "1h" }
-      );
-
-      const client2 = new Client(
-        `http://localhost:${httpServer.address().port}`,
-        {
-          auth: { token: token2 },
-        }
-      );
-
-      client2.on("connect", () => {
-        // Simular que ambos usuarios están editando la misma nota
-        clientSocket.join("note-456");
-        client2.join("note-456");
-
-        client2.on("note-changed", (data) => {
-          expect(data.noteId).toBe("note-456");
-          expect(data.content).toBe("Contenido actualizado");
-          expect(data.userId).toBe("test-user-1");
-          client2.close();
-          done();
-        });
-
-        // Simular actualización de nota
-        setTimeout(() => {
-          clientSocket.emit("note-update", {
-            noteId: "note-456",
-            content: "Contenido actualizado",
-          });
-        }, 100);
-      });
-    });
-
-    test("debe sincronizar posiciones de cursor", (done) => {
-      const token2 = jwt.sign(
-        { userId: "test-user-2", email: "test2@example.com" },
-        JWT_SECRET,
-        { expiresIn: "1h" }
-      );
-
-      const client2 = new Client(
-        `http://localhost:${httpServer.address().port}`,
-        {
-          auth: { token: token2 },
-        }
-      );
-
-      client2.on("connect", () => {
-        client2.on("cursor-update", (data) => {
-          expect(data.userId).toBe("test-user-1");
-          expect(data.userEmail).toBe("test@example.com");
-          expect(data.position).toBe(42);
-          client2.close();
-          done();
-        });
-
-        setTimeout(() => {
-          clientSocket.emit("cursor-position", {
-            noteId: "note-789",
-            position: 42,
-            selection: { start: 42, end: 50 },
-          });
-        }, 100);
-      });
-    });
-  });
-
-  describe("Manejo de Errores", () => {
-    test("debe manejar desconexiones inesperadas", (done) => {
-      clientSocket.on("disconnect", (reason) => {
-        expect(reason).toBeDefined();
-        done();
-      });
-
-      // Simular desconexión
-      clientSocket.disconnect();
-    });
-
-    test("debe manejar eventos malformados", (done) => {
-      // Enviar datos inválidos
-      clientSocket.emit("send-message", null);
-      clientSocket.emit("note-update", { noteId: null });
-
-      // Si no hay errores después de 100ms, el test pasa
-      setTimeout(() => {
-        expect(clientSocket.connected).toBe(true);
-        done();
-      }, 100);
-    });
-  });
-
-  describe("Rendimiento", () => {
-    test("debe manejar múltiples mensajes rápidos", (done) => {
-      clientSocket.emit("join-workspace", "workspace-perf");
-
-      let messageCount = 0;
-      const totalMessages = 50;
-
-      clientSocket.on("message-sent", () => {
-        messageCount++;
-        if (messageCount === totalMessages) {
-          expect(messageCount).toBe(totalMessages);
-          done();
-        }
-      });
-
-      // Enviar múltiples mensajes rápidamente
-      for (let i = 0; i < totalMessages; i++) {
-        clientSocket.emit("send-message", {
-          content: `Mensaje ${i}`,
-          workspaceId: "workspace-perf",
-        });
-      }
-    });
-
-    test("debe mantener la conexión bajo carga", (done) => {
-      const startTime = Date.now();
-      let operationsCompleted = 0;
-      const totalOperations = 100;
-
-      const completeOperation = () => {
-        operationsCompleted++;
-        if (operationsCompleted === totalOperations) {
-          const endTime = Date.now();
-          const duration = endTime - startTime;
-
-          expect(duration).toBeLessThan(5000); // Menos de 5 segundos
-          expect(clientSocket.connected).toBe(true);
-          done();
-        }
+        senderEmail: "test@example.com",
+        senderName: "Test User",
+        content: "Hello world",
       };
 
-      // Realizar múltiples operaciones
-      for (let i = 0; i < totalOperations; i++) {
-        setTimeout(() => {
-          clientSocket.emit("cursor-position", {
-            noteId: "note-perf",
-            position: i,
-            selection: { start: i, end: i + 1 },
-          });
-          completeOperation();
-        }, i * 10);
+      await chatHandler.handleNewMessage(mockSocket, messageData);
+
+      expect(metricsService.errorOccurred).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith("error", expect.any(Object));
+    });
+
+    test("WorkspaceHandler debe manejar errores de Redis", async () => {
+      const workspaceHandler = new WorkspaceHandler(mockIo);
+      redisService.get.mockRejectedValueOnce(
+        new Error("Redis connection failed")
+      );
+
+      await workspaceHandler.handleGetWorkspaceUsers(
+        mockSocket,
+        "workspace-123"
+      );
+
+      expect(metricsService.errorOccurred).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith("error", expect.any(Object));
+    });
+
+    test("NoteHandler debe manejar errores de Redis", async () => {
+      const noteHandler = new NoteHandler(mockIo);
+      redisService.set.mockRejectedValueOnce(
+        new Error("Redis connection failed")
+      );
+
+      const workspaceId = "workspace-123";
+      const noteId = "note-456";
+      const userData = {
+        id: "user-1",
+        email: "test@example.com",
+        name: "Test User",
+      };
+
+      await noteHandler.handleJoinNote(
+        mockSocket,
+        workspaceId,
+        noteId,
+        userData
+      );
+
+      expect(metricsService.errorOccurred).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith("error", expect.any(Object));
+    });
+
+    test("CollectionHandler debe manejar errores de Redis", async () => {
+      const collectionHandler = new CollectionHandler(mockIo);
+      redisService.set.mockRejectedValueOnce(
+        new Error("Redis connection failed")
+      );
+
+      const workspaceId = "workspace-123";
+      const collectionId = "collection-456";
+      const userData = {
+        id: "user-1",
+        email: "test@example.com",
+        name: "Test User",
+      };
+
+      await collectionHandler.handleJoinCollection(
+        mockSocket,
+        workspaceId,
+        collectionId,
+        userData
+      );
+
+      expect(metricsService.errorOccurred).toHaveBeenCalled();
+      expect(mockSocket.emit).toHaveBeenCalledWith("error", expect.any(Object));
+    });
+  });
+
+  describe("Performance", () => {
+    test("debe procesar múltiples mensajes eficientemente", async () => {
+      const chatHandler = new ChatHandler(mockIo);
+      const messageCount = 10;
+      const startTime = Date.now();
+
+      const promises = [];
+      for (let i = 0; i < messageCount; i++) {
+        const messageData = {
+          workspaceId: "workspace-perf",
+          senderEmail: "test@example.com",
+          senderName: "Test User",
+          content: `Message ${i}`,
+        };
+        promises.push(chatHandler.handleNewMessage(mockSocket, messageData));
       }
+
+      await Promise.all(promises);
+
+      const duration = Date.now() - startTime;
+      expect(duration).toBeLessThan(1000); // Menos de 1 segundo
+      expect(redisService.set).toHaveBeenCalledTimes(messageCount);
+      expect(metricsService.messageProcessed).toHaveBeenCalledTimes(
+        messageCount
+      );
+    });
+
+    test("debe manejar múltiples operaciones de workspace", async () => {
+      const workspaceHandler = new WorkspaceHandler(mockIo);
+      const operationCount = 5;
+
+      redisService.get.mockResolvedValue({});
+
+      const promises = [];
+      for (let i = 0; i < operationCount; i++) {
+        const userData = {
+          id: `user-${i}`,
+          email: `user${i}@example.com`,
+          name: `User ${i}`,
+        };
+        promises.push(
+          workspaceHandler.handleJoinWorkspace(
+            mockSocket,
+            "workspace-perf",
+            userData
+          )
+        );
+      }
+
+      await Promise.all(promises);
+
+      expect(redisService.set).toHaveBeenCalledTimes(operationCount);
+      expect(metricsService.userJoinedWorkspace).toHaveBeenCalledTimes(
+        operationCount
+      );
+    });
+
+    test("debe manejar múltiples actualizaciones de nota eficientemente", async () => {
+      const noteHandler = new NoteHandler(mockIo);
+      const updateCount = 10;
+
+      const promises = [];
+      for (let i = 0; i < updateCount; i++) {
+        promises.push(
+          noteHandler.handleContentUpdate(
+            mockSocket,
+            "workspace-perf",
+            "note-perf",
+            `Content update ${i}`
+          )
+        );
+      }
+
+      await Promise.all(promises);
+
+      expect(redisService.set).toHaveBeenCalledTimes(updateCount);
+      expect(mockIo.to).toHaveBeenCalledTimes(updateCount);
+    });
+  });
+
+  describe("Integration Tests", () => {
+    test("debe manejar flujo completo de chat en workspace", async () => {
+      const workspaceHandler = new WorkspaceHandler(mockIo);
+      const chatHandler = new ChatHandler(mockIo);
+
+      const workspaceId = "workspace-integration";
+      const userData = {
+        id: "user-1",
+        email: "test@example.com",
+        name: "Test User",
+      };
+
+      redisService.get.mockResolvedValue({});
+
+      // Usuario se une al workspace
+      await workspaceHandler.handleJoinWorkspace(
+        mockSocket,
+        workspaceId,
+        userData
+      );
+
+      // Usuario envía mensaje
+      const messageData = {
+        workspaceId,
+        senderEmail: userData.email,
+        senderName: userData.name,
+        content: "Hello from integration test",
+      };
+
+      await chatHandler.handleNewMessage(mockSocket, messageData);
+
+      // Verificar que ambas operaciones funcionaron
+      expect(mockSocket.join).toHaveBeenCalledWith(workspaceId);
+      expect(mockIo.to).toHaveBeenCalledWith(workspaceId);
+      expect(redisService.set).toHaveBeenCalledTimes(2); // Workspace users + message
+    });
+
+    test("debe manejar flujo completo de edición colaborativa", async () => {
+      const workspaceHandler = new WorkspaceHandler(mockIo);
+      const noteHandler = new NoteHandler(mockIo);
+
+      const workspaceId = "workspace-collab";
+      const noteId = "note-collab";
+      const userData = {
+        id: "user-1",
+        email: "test@example.com",
+        name: "Test User",
+      };
+
+      redisService.get.mockResolvedValue({});
+
+      // Usuario se une al workspace
+      await workspaceHandler.handleJoinWorkspace(
+        mockSocket,
+        workspaceId,
+        userData
+      );
+
+      // Usuario se une a la nota
+      await noteHandler.handleJoinNote(
+        mockSocket,
+        workspaceId,
+        noteId,
+        userData
+      );
+
+      // Usuario actualiza contenido
+      await noteHandler.handleContentUpdate(
+        mockSocket,
+        workspaceId,
+        noteId,
+        "Collaborative content"
+      );
+
+      // Usuario actualiza cursor
+      await noteHandler.handleCursorUpdate(mockSocket, workspaceId, noteId, {
+        position: 10,
+      });
+
+      // Verificar flujo completo
+      expect(mockSocket.join).toHaveBeenCalledWith(workspaceId);
+      expect(mockSocket.join).toHaveBeenCalledWith(
+        `note:${workspaceId}:${noteId}`
+      );
+      expect(mockIo.to).toHaveBeenCalledWith(`note:${workspaceId}:${noteId}`);
     });
   });
 });
