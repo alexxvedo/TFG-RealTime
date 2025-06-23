@@ -5,16 +5,19 @@ Este proyecto implementa un servidor WebSocket robusto y modular utilizando Sock
 ## Características
 
 ### Arquitectura
+
 - **Modular**: Código organizado en módulos independientes por funcionalidad
 - **Escalabilidad horizontal**: Integración con Redis para compartir estado entre múltiples instancias
 - **Autenticación JWT**: Seguridad mejorada para conexiones WebSocket
 
 ### Funcionalidades
+
 - **Reconexión inteligente**: Lógica mejorada de reconexión y recuperación de estado
 - **Compresión de mensajes**: Reducción del tamaño de los payloads
 - **Canales privados**: Salas con autenticación para comunicación segura
 
 ### Monitoreo
+
 - **Métricas en tiempo real**: Dashboard para monitorear conexiones y actividad
 - **Logging estructurado**: Sistema avanzado de logs para facilitar el debugging
 
@@ -45,11 +48,13 @@ src/
 ## Instalación
 
 1. Instalar dependencias:
+
    ```
    npm install
    ```
 
 2. Configurar variables de entorno (crear archivo `.env`):
+
    ```
    PORT=3001
    NODE_ENV=development
@@ -60,11 +65,13 @@ src/
    ```
 
 3. Iniciar el servidor:
+
    ```
    npm start
    ```
 
    Para desarrollo con recarga automática:
+
    ```
    npm run dev
    ```
@@ -78,25 +85,39 @@ src/
 ## Eventos WebSocket
 
 ### Workspace
+
 - `join_workspace`: Unirse a un workspace
 - `leave_workspace`: Salir de un workspace
 - `get_workspace_users`: Obtener usuarios conectados a un workspace
 
 ### Colecciones
+
 - `join_collection`: Unirse a una colección
 - `leave_collection`: Salir de una colección
 - `get_collections_users`: Obtener usuarios en todas las colecciones
 
 ### Chat
+
 - `new_message`: Enviar un nuevo mensaje
 - `user_typing`: Indicar que un usuario está escribiendo
 - `user_stop_typing`: Indicar que un usuario dejó de escribir
 
 ### Notas
+
 - `join_note`: Unirse a una nota colaborativa
 - `leave_note`: Salir de una nota
 - `cursor_update`: Actualizar posición del cursor
 - `note_content_update`: Actualizar contenido de la nota
+
+### Tareas/Agenda
+
+- `join_agenda`: Unirse a la vista de agenda
+- `leave_agenda`: Salir de la vista de agenda
+- `get_agenda_users`: Obtener usuarios conectados en la agenda
+- `task_created`: Notificar creación de nueva tarea
+- `task_updated`: Notificar actualización de tarea
+- `task_deleted`: Notificar eliminación de tarea
+- `task_moved`: Notificar movimiento de tarea entre estados
 
 ## Escalabilidad Horizontal
 
@@ -116,10 +137,10 @@ Accede a las métricas en tiempo real en `http://localhost:3001/metrics`. En pro
 En producción, todas las conexiones WebSocket requieren autenticación JWT. El token debe enviarse en el handshake:
 
 ```javascript
-const socket = io('http://localhost:3001', {
+const socket = io("http://localhost:3001", {
   auth: {
-    token: 'your-jwt-token'
-  }
+    token: "your-jwt-token",
+  },
 });
 ```
 
